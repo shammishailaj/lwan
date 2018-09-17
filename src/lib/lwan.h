@@ -163,6 +163,7 @@ static ALWAYS_INLINE int16_t string_as_int16(const char *s)
 #endif
 
 enum lwan_http_status {
+    HTTP_SWITCHING_PROTOCOLS = 101,
     HTTP_OK = 200,
     HTTP_PARTIAL_CONTENT = 206,
     HTTP_MOVED_PERMANENTLY = 301,
@@ -195,6 +196,7 @@ enum lwan_handler_flags {
     HANDLER_CAN_REWRITE_URL = 1<<7,
     HANDLER_PARSE_COOKIES = 1<<8,
     HANDLER_DATA_IS_HASH_TABLE = 1<<9,
+    HANDLER_ALLOW_UPGRADE = 1<<10,
 
     HANDLER_PARSE_MASK = 1<<0 | 1<<1 | 1<<2 | 1<<3 | 1<<4 | 1<<8
 };
@@ -211,24 +213,26 @@ enum lwan_request_flags {
     REQUEST_ALLOW_PROXY_REQS_SHIFT = 6,
     REQUEST_ALLOW_CORS_SHIFT = 8,
 
-    REQUEST_METHOD_MASK        = 1<<0 | 1<<1 | 1<<2,
-    REQUEST_METHOD_GET         = 1<<0,
-    REQUEST_METHOD_POST        = 1<<1,
-    REQUEST_METHOD_HEAD        = 1<<0 | 1<<1,
-    REQUEST_METHOD_OPTIONS     = 1<<2,
-    REQUEST_METHOD_DELETE      = 1<<2 | 1<<0,
+    REQUEST_METHOD_MASK = 1 << 0 | 1 << 1 | 1 << 2,
+    REQUEST_METHOD_GET = 1 << 0,
+    REQUEST_METHOD_POST = 1 << 1,
+    REQUEST_METHOD_HEAD = 1 << 0 | 1 << 1,
+    REQUEST_METHOD_OPTIONS = 1 << 2,
+    REQUEST_METHOD_DELETE = 1 << 2 | 1 << 0,
 
-    REQUEST_ACCEPT_DEFLATE     = 1<<3,
-    REQUEST_ACCEPT_GZIP        = 1<<4,
-    REQUEST_IS_HTTP_1_0        = 1<<5,
-    REQUEST_ALLOW_PROXY_REQS   = 1<<REQUEST_ALLOW_PROXY_REQS_SHIFT,
-    REQUEST_PROXIED            = 1<<7,
-    REQUEST_ALLOW_CORS         = 1<<REQUEST_ALLOW_CORS_SHIFT,
+    REQUEST_ACCEPT_DEFLATE = 1 << 3,
+    REQUEST_ACCEPT_GZIP = 1 << 4,
+    REQUEST_IS_HTTP_1_0 = 1 << 5,
+    REQUEST_ALLOW_PROXY_REQS = 1 << REQUEST_ALLOW_PROXY_REQS_SHIFT,
+    REQUEST_PROXIED = 1 << 7,
+    REQUEST_ALLOW_CORS = 1 << REQUEST_ALLOW_CORS_SHIFT,
 
-    RESPONSE_SENT_HEADERS      = 1<<9,
-    RESPONSE_CHUNKED_ENCODING  = 1<<10,
-    RESPONSE_NO_CONTENT_LENGTH = 1<<11,
-    RESPONSE_URL_REWRITTEN     = 1<<12,
+    RESPONSE_SENT_HEADERS = 1 << 9,
+    RESPONSE_CHUNKED_ENCODING = 1 << 10,
+    RESPONSE_NO_CONTENT_LENGTH = 1 << 11,
+    RESPONSE_URL_REWRITTEN = 1 << 12,
+
+    REQUEST_IS_WEBSOCKET = 1 << 13 | RESPONSE_SENT_HEADERS,
 };
 
 enum lwan_connection_flags {
@@ -433,6 +437,9 @@ void lwan_response_send_chunk(struct lwan_request *request);
 
 bool lwan_response_set_event_stream(struct lwan_request *request, enum lwan_http_status status);
 void lwan_response_send_event(struct lwan_request *request, const char *event);
+
+void lwan_response_websocket_write(struct lwan_request *request);
+bool lwan_response_websocket_read(struct lwan_request *request);
 
 const char *lwan_http_status_as_string(enum lwan_http_status status)
     __attribute__((const)) __attribute__((warn_unused_result));

@@ -36,9 +36,12 @@
 
 #include "lwan-private.h"
 
+#include "base64.h"
+#include "list.h"
 #include "lwan-config.h"
 #include "lwan-http-authorize.h"
-#include "list.h"
+#include "lwan-io-wrappers.h"
+#include "sha1.h"
 
 enum lwan_read_finalizer {
     FINALIZER_DONE,
@@ -63,6 +66,9 @@ struct request_parser_helper {
 
     struct lwan_value post_data;
     struct lwan_value content_type;
+
+    struct lwan_value upgrade;
+    struct lwan_value sec_websocket_key;
 
     time_t error_when_time;
     int error_when_n_packets;
@@ -558,6 +564,18 @@ static char *parse_headers(struct request_parser_helper *helper,
         case MULTICHAR_CONSTANT_L('C','o','o','k'):
             helper->cookie = HEADER("Cookie");
             break;
+        case MULTICHAR_CONSTANT_L('U','p','g','r'):
+            helper->upgrade = HEADER("Upgrade");
+            break;
+        case MULTICHAR_CONSTANT_L('S','e','c','-'):
+            p += sizeof("Sec-WebSocket") - 1;
+
+            STRING_SWITCH_L(p) {
+            case MULTICHAR_CONSTANT_L('-','K','e','y'):
+                helper->sec_websocket_key = HEADER("-Key");
+                break;
+            }
+            break;
         case MULTICHAR_CONSTANT_L('I','f','-','M'):
             helper->if_modified_since = HEADER("If-Modified-Since");
             break;
@@ -1045,18 +1063,72 @@ parse_http_request(struct lwan_request *request, struct request_parser_helper *h
 }
 
 static enum lwan_http_status
-prepare_for_response(struct lwan_url_map *url_map,
-                      struct lwan_request *request,
+try_websocket_upgrade(struct lwan_request *request,
                       struct request_parser_helper *helper)
 {
+    static const unsigned char websocket_uuid[] =
+        "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    char header_buf[DEFAULT_HEADERS_SIZE];
+    size_t header_buf_len;
+    unsigned char digest[20];
+    sha1_context ctx;
+    char *encoded;
+
+    if (helper->connection != 'u')
+        return HTTP_OK;
+    if (helper->upgrade.len != sizeof("websocket") - 1)
+        return HTTP_OK;
+    if (memcmp(helper->upgrade.value, "websocket", sizeof("websocket") - 1))
+        return HTTP_OK;
+    if (UNLIKELY(!helper->sec_websocket_key.len))
+        return HTTP_BAD_REQUEST;
+    if (UNLIKELY(!base64_validate((void *)helper->sec_websocket_key.value,
+                                  helper->sec_websocket_key.len)))
+        return HTTP_BAD_REQUEST;
+
+    sha1_init(&ctx);
+    sha1_update(&ctx, (unsigned char *)helper->sec_websocket_key.value,
+                helper->sec_websocket_key.len);
+    sha1_update(&ctx, websocket_uuid, sizeof(websocket_uuid) - 1);
+    sha1_finalize(&ctx, digest);
+
+    encoded = (char *)base64_encode(digest, sizeof(digest), NULL);
+    if (UNLIKELY(!encoded))
+        return HTTP_INTERNAL_ERROR;
+    coro_defer(request->conn->coro, CORO_DEFER(free), encoded);
+
+    header_buf_len = lwan_prepare_response_header_full(
+        request, HTTP_SWITCHING_PROTOCOLS, header_buf, sizeof(header_buf),
+        (struct lwan_key_value[]){
+            {.key = "Sec-WebSocket-Accept", .value = encoded},
+            {.key = "Upgrade", .value = "websocket"},
+            {.key = "Connection", .value = "Upgrade"},
+            {},
+        });
+    if (LIKELY(header_buf_len)) {
+        lwan_send(request, header_buf, header_buf_len, 0);
+        request->flags |= REQUEST_IS_WEBSOCKET;
+
+        return HTTP_SWITCHING_PROTOCOLS;
+    }
+
+    return HTTP_INTERNAL_ERROR;
+}
+
+static enum lwan_http_status
+prepare_for_response(struct lwan_url_map *url_map,
+                     struct lwan_request *request,
+                     struct request_parser_helper *helper)
+{
+    enum lwan_http_status status;
+
     request->url.value += url_map->prefix_len;
     request->url.len -= url_map->prefix_len;
 
     if (url_map->flags & HANDLER_MUST_AUTHORIZE) {
-        if (!lwan_http_authorize(request,
-                        &helper->authorization,
-                        url_map->authorization.realm,
-                        url_map->authorization.password_file))
+        if (!lwan_http_authorize(request, &helper->authorization,
+                                 url_map->authorization.realm,
+                                 url_map->authorization.password_file))
             return HTTP_NOT_AUTHORIZED;
     }
 
@@ -1082,9 +1154,8 @@ prepare_for_response(struct lwan_url_map *url_map,
         }
     }
 
-    if (lwan_request_get_method(request) == REQUEST_METHOD_POST) {
-        enum lwan_http_status status;
-
+    switch (lwan_request_get_method(request)) {
+    case REQUEST_METHOD_POST:
         if (!(url_map->flags & HANDLER_PARSE_POST_DATA)) {
             /* FIXME: Discard POST data here? If a POST request is sent
              * to a handler that is not supposed to handle a POST request,
@@ -1099,6 +1170,17 @@ prepare_for_response(struct lwan_url_map *url_map,
             return status;
 
         parse_post_data(request, helper);
+        break;
+
+    case REQUEST_METHOD_GET:
+        if (url_map->flags & HANDLER_ALLOW_UPGRADE) {
+            status = try_websocket_upgrade(request, helper);
+            if (status != HTTP_OK)
+                return status;
+        }
+        break;
+    default:
+        break;
     }
 
     return HTTP_OK;
@@ -1121,9 +1203,10 @@ handle_rewrite(struct lwan_request *request, struct request_parser_helper *helpe
     return true;
 }
 
-char *
-lwan_process_request(struct lwan *l, struct lwan_request *request,
-    struct lwan_value *buffer, char *next_request)
+char *lwan_process_request(struct lwan *l,
+                           struct lwan_request *request,
+                           struct lwan_value *buffer,
+                           char *next_request)
 {
     enum lwan_http_status status;
     struct lwan_url_map *url_map;
@@ -1164,8 +1247,14 @@ lookup_again:
 
     status = prepare_for_response(url_map, request, &helper);
     if (UNLIKELY(status != HTTP_OK)) {
-        lwan_default_response(request, status);
-        goto out;
+        /* Headers may be sent while upgrading to a WebSockets connection.
+         * FIXME: make websockets upgrade explicit rather than implicit to allow
+         * user controlling if upgrade is desirable or not.  Then get rid of this
+         * check here. */
+        if (!(request->flags & RESPONSE_SENT_HEADERS)) {
+            lwan_default_response(request, status);
+            goto out;
+        }
     }
 
     status = url_map->handler(request, &request->response, url_map->data);
